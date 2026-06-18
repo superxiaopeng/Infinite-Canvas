@@ -6667,7 +6667,8 @@ function defaultCanvasPromptTemplateGroups(){
         {id:'character', name:tr('smart.tplCatCharacter')},
         {id:'product', name:tr('smart.tplCatProduct')},
         {id:'lighting', name:tr('smart.tplCatLighting')},
-        {id:'mine', name:tr('smart.tplCatMine')}
+        // “我的”分组在后端/智能画布里用的分类 id 是 custom，这里保持一致，否则后端 custom 条目在普通画布看不到。
+        {id:'custom', name:tr('smart.tplCatMine')}
     ];
 }
 function loadCanvasPromptTemplateGroups(){
@@ -6719,7 +6720,9 @@ function activeCanvasPromptLibraryItems(){
             ...(canvasPromptTemplateOverrides.editedBuiltins?.[t.id] || {}),
             sourceId:t.id,
             builtin:true,
-            remote:false,
+            // 系统提示词库本身是后端真实库（/api/prompt-libraries 返回的 system 库），标记为 remote，
+            // 这样编辑/删除走后端 PATCH/DELETE 并同步（与智能画布一致），而不是只存本地、不同步。
+            remote:true,
             libraryId:'system',
             libraryName:'系统提示词库',
         }));
@@ -6763,6 +6766,7 @@ function canvasPromptTemplateCategoryLabel(category){
         character:tr('smart.tplCatCharacter'),
         product:tr('smart.tplCatProduct'),
         lighting:tr('smart.tplCatLighting'),
+        custom:tr('smart.tplCatMine'),
         mine:tr('smart.tplCatMine')
     };
     return builtin[category] || promptTemplateGroups.find(g => g.id === category)?.name || category || '';
@@ -6804,8 +6808,9 @@ function canvasPromptTemplateVisibleItems(){
     });
 }
 function currentCanvasPromptTemplateLibraryEditable(){
+    // 系统库后端 readonly=false，也允许新增/编辑（走后端，与智能画布、素材库管理同步）。只按 readonly 判断。
     const lib = activeCanvasPromptLibrary();
-    return Boolean(lib && lib.id !== 'system' && !lib.readonly);
+    return Boolean(lib && !lib.readonly);
 }
 function currentCanvasPromptTemplateNodeText(){
     const node = nodes.find(n => n.id === promptTemplateNodeId && n.type === 'prompt');
@@ -6844,7 +6849,7 @@ async function saveCurrentCanvasPromptAsTemplate(){
             body:JSON.stringify({
                 library_id:lib.id,
                 name:canvasPromptTemplateDefaultName(text),
-                category:promptTemplateCategory === 'all' ? 'mine' : promptTemplateCategory,
+                category:promptTemplateCategory === 'all' ? 'custom' : promptTemplateCategory,
                 positive:text,
                 scene:'我的提示词预设'
             })
@@ -6863,7 +6868,7 @@ async function saveCurrentCanvasPromptAsTemplate(){
 async function createBlankCanvasPromptTemplate(){
     const lib = activeCanvasPromptLibrary();
     if(!currentCanvasPromptTemplateLibraryEditable()){ setStatus('请选择可编辑的提示词库'); return; }
-    const category = promptTemplateCategory && promptTemplateCategory !== 'all' ? promptTemplateCategory : 'mine';
+    const category = promptTemplateCategory && promptTemplateCategory !== 'all' ? promptTemplateCategory : 'custom';
     try {
         const data = await fetch('/api/prompt-libraries/items', {
             method:'POST',
@@ -6891,7 +6896,8 @@ async function saveCanvasPromptTemplateEdit(){
     const category = promptTemplatePanel.querySelector('[data-template-edit-category]')?.value || 'mine';
     if(!name || !positive){ setStatus(tr('smart.tplRequired')); return; }
     try {
-        if(item.builtin){
+        // 仅当模板不是后端项（非 remote）时才退回本地覆盖；系统库现在是 remote，走下面的后端 PATCH 同步。
+        if(item.builtin && !item.remote){
             canvasPromptTemplateOverrides.editedBuiltins = canvasPromptTemplateOverrides.editedBuiltins || {};
             canvasPromptTemplateOverrides.editedBuiltins[item.sourceId || item.id] = {
                 ...(canvasPromptTemplateOverrides.editedBuiltins[item.sourceId || item.id] || {}),
@@ -6913,6 +6919,12 @@ async function saveCanvasPromptTemplateEdit(){
             if(!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || '保存失败');
             return r.json();
         });
+        // 迁移：清掉这条系统模板的旧本地覆盖，避免它盖住刚同步到后端的最新内容。
+        const legacyKey = item.sourceId || item.id;
+        if(canvasPromptTemplateOverrides.editedBuiltins && canvasPromptTemplateOverrides.editedBuiltins[legacyKey]){
+            delete canvasPromptTemplateOverrides.editedBuiltins[legacyKey];
+            saveCanvasPromptTemplateOverrides();
+        }
         syncCanvasPromptTemplateMutation(data, item.id);
         promptTemplateEditing = false;
         renderPromptTemplateModal();
@@ -6925,7 +6937,8 @@ async function deleteCanvasPromptTemplate(){
     if(!item) return;
     if(!window.confirm(`删除提示词「${canvasPromptTemplateName(item) || '提示词'}」？`)) return;
     try {
-        if(item.builtin){
+        // 系统库现在是 remote，删除走后端 DELETE 并同步；仅非 remote 的内置项才退回本地隐藏。
+        if(item.builtin && !item.remote){
             canvasPromptTemplateOverrides.hiddenBuiltinIds = [...new Set([...(canvasPromptTemplateOverrides.hiddenBuiltinIds || []), item.sourceId || item.id])];
             saveCanvasPromptTemplateOverrides();
             promptTemplateSelectedId = '';

@@ -1119,12 +1119,30 @@ function scaleSmartGroupMemberToZoom(group, member, zoom){
     if(isSmartImageNode(member)) member.scale = 1;
 }
 function addNodeToSmartGroup(group, child){
-    if(!isSmartGroupNode(group) || !child || child.id === group.id || isSmartGroupNode(child)) return false;
+    if(!isSmartGroupNode(group) || !child || child.id === group.id) return false;
     const items = Array.isArray(group.items) ? group.items.slice() : [];
+    const zoom = smartGroupZoom(group);
+    if(isSmartGroupNode(child)){
+        // 把一个分组拖进另一个分组：直接“释放”被拖的分组——只把它的成员（图片等节点）并入主分组，
+        // 然后删除被拖分组本体。等同于把那些节点逐个手动拖进来，避免嵌套分组带来的各种边角 bug。
+        const childMemberIds = smartGroupMembers(child)
+            .map(m => m.id)
+            .filter(id => id !== group.id && !items.includes(id));
+        group.items = [...items, ...childMemberIds];
+        childMemberIds.forEach(id => {
+            const m = nodes.find(n => n.id === id);
+            if(m) scaleSmartGroupMemberToZoom(group, m, zoom);
+        });
+        // 释放（删除）被拖入的分组本体；它的成员已经成为主分组成员。
+        nodes = nodes.filter(n => n.id !== child.id);
+        if(canvas) canvas.connections = (canvas.connections || []).filter(c => c.from !== child.id && c.to !== child.id);
+        nodes.forEach(g => { if(isSmartGroupNode(g) && Array.isArray(g.items)) g.items = g.items.filter(id => id !== child.id); });
+        return true;
+    }
     if(items.includes(child.id)) return false;
     group.items = [...items, child.id];
     // 新入组成员贴合分组当前缩放（分组已缩小时丢进来的成员也跟着变小）；只改尺寸、保持落点不跳动。
-    scaleSmartGroupMemberToZoom(group, child, smartGroupZoom(group));
+    scaleSmartGroupMemberToZoom(group, child, zoom);
     return true;
 }
 function mediaLayoutSize(img){
@@ -4246,7 +4264,9 @@ function smartNodeInFlight(node){
 }
 function syncRunButtonState(node=selectedNode()){
     if(!runBtn) return;
-    runBtn.disabled = !isSmartRunnableNode(node) || smartCascadeAnyRunning() || smartNodeInFlight(node);
+    // 只在“当前选中节点自己”忙时禁用运行：节点正在生成/排队，或它本身是正在跑的循环。
+    // 不再因为“画布上有任意循环/级联在跑”就全局禁用——跑循环时仍可对其他节点点生成。
+    runBtn.disabled = !isSmartRunnableNode(node) || smartNodeInFlight(node) || smartCascadeIsLoopRunning(node?.id);
 }
 function mergeSmartNode(local, remote){
     // 本地正在生成/排队的节点完全以本地为准，只把对方可能多出来的图并进来，绝不被对方旧状态冲掉
@@ -7234,12 +7254,16 @@ function restoreDraggedNodePosition(){
     });
 }
 function pruneSmartGroupMembershipsForNode(node){
-    if(!node || !node.id) return;
+    if(!node || !node.id) return false;
+    // 节点拖出分组：从所有分组移除自己（保持当前尺寸，不自动放大）。
+    // 分组合并已改为“释放被拖分组、只并入其成员”，所以这里只需处理单个节点的退组。
+    let changed = false;
     nodes.forEach(group => {
-        if(!isSmartGroupNode(group) || !Array.isArray(group.items)) return;
-        if(group.items.includes(node.id)) group.items = group.items.filter(id => id !== node.id);
+        if(!isSmartGroupNode(group) || !Array.isArray(group.items) || !group.items.includes(node.id)) return;
+        group.items = group.items.filter(id => id !== node.id);
+        changed = true;
     });
-    // 拖出分组保持当前尺寸（不自动放大），无需额外处理。
+    return changed;
 }
 function clearDropHighlight(){
     world.querySelectorAll('.image-node.drop-target').forEach(el => el.classList.remove('drop-target'));
@@ -9964,6 +9988,7 @@ function reorderManualInputRefs(currentNode, fromKey, targetKey, placement='befo
     if(placement === 'after') insertAt += 1;
     refs.splice(insertAt, 0, moved);
     currentNode.manualInputRefs = refs;
+    if(inputThumbsRow) delete inputThumbsRow.dataset.thumbsSig;
     renderInputThumbsRow(currentNode);
     scheduleSave();
     return true;
@@ -10057,6 +10082,8 @@ function reorderInputThumb(currentNode, items, from, to, placement='before'){
     // Reorder within a source group's images first; separate input nodes use the
     // current node's input order, with a visual-position swap as a final fallback.
     if(from < 0 || to < 0 || from >= items.length || to >= items.length) return;
+    // 强制让缩略图条在重排后重建（绕过 renderInputThumbsRow 的“无变化跳过”缓存），否则顺序看起来没变。
+    if(inputThumbsRow) delete inputThumbsRow.dataset.thumbsSig;
     const fromImg = items[from];
     const toImg = items[to];
     if(!fromImg || !toImg) return;
@@ -10075,6 +10102,21 @@ function reorderInputThumb(currentNode, items, from, to, placement='before'){
         }
         render();
         scheduleSave();
+        return;
+    }
+    // 分组：缩略图来自各成员节点，跨成员拖动应改变 group.items 的成员顺序（= 图1234 的编号顺序），
+    // 而不是去交换节点的画布位置（那只改了图层上下层级）。
+    if(isSmartGroupNode(currentNode) && Array.isArray(currentNode.items)
+        && fromImg.nodeId !== toImg.nodeId
+        && currentNode.items.includes(fromImg.nodeId) && currentNode.items.includes(toImg.nodeId)){
+        const next = movedBeforeAfterIds(currentNode.items.slice(), fromImg.nodeId, toImg.nodeId, placement);
+        if(!sameOrderedIds(currentNode.items, next)){
+            pushUndo();
+            currentNode.items = next;
+            if(inputThumbsRow) delete inputThumbsRow.dataset.thumbsSig;
+            render();
+            scheduleSave();
+        }
         return;
     }
     const canReorderSources = currentNode && fromImg.nodeId && toImg.nodeId;
@@ -13650,7 +13692,25 @@ function groupSelectedNodes(){
 }
 function ungroupNode(groupId){
     const group = nodes.find(n => n.id === groupId);
-    if(!group || !Array.isArray(group.images) || group.images.length < 2) return false;
+    if(!group) return false;
+    // 释放智能分组：删除分组容器即可，成员本就是画布上的独立节点，原地保留（保持当前尺寸，不自动放大）。
+    if(isSmartGroupNode(group)){
+        pushUndo();
+        const memberIds = smartGroupMembers(group).map(m => m.id);
+        nodes = nodes.filter(n => n.id !== groupId);
+        if(canvas) canvas.connections = (canvas.connections || []).filter(c => c.from !== groupId && c.to !== groupId);
+        nodes.forEach(node => {
+            if(Array.isArray(node.inputNodeIds)) node.inputNodeIds = node.inputNodeIds.filter(id => id !== groupId);
+            if(isSmartGroupNode(node) && Array.isArray(node.items)) node.items = node.items.filter(id => id !== groupId);
+        });
+        selectedIds = memberIds.filter(id => nodes.some(n => n.id === id));
+        selectedId = selectedIds.length === 1 ? selectedIds[0] : '';
+        selectedImage = {nodeId:'', index:-1};
+        render();
+        scheduleSave();
+        return true;
+    }
+    if(!Array.isArray(group.images) || group.images.length < 2) return false;
     pushUndo();
     const layout = imageLayout(group.images || [], nodeScale(group), group);
     const pad = 16;
@@ -13721,7 +13781,8 @@ function mergeImageNodesIntoGroup(sourceId, targetId){
     return true;
 }
 function smartGroupTargetForDraggedNode(draggedNode){
-    if(!draggedNode || isSmartGroupNode(draggedNode)) return null;
+    // 允许把一个分组拖进另一个分组（拖来的分组的成员会作为输入并入目标分组）。自身/被拖分组及其成员已在 excluded 中排除。
+    if(!draggedNode) return null;
     const r = nodeRect(draggedNode);
     const excluded = new Set([draggedNode.id, ...(dragState?.groupIds || [])]);
     const cx = r.x + r.width / 2;
@@ -13736,10 +13797,12 @@ function smartGroupTargetForDraggedNode(draggedNode){
 }
 function addDraggedNodeToSmartGroup(draggedNode, group){
     if(!draggedNode || !group) return false;
+    const wasGroup = isSmartGroupNode(draggedNode);
     const added = addNodeToSmartGroup(group, draggedNode);
     if(!added) return false;
     selectedIds = [];
-    selectedId = draggedNode.id;
+    // 拖入的是分组时它已被释放（删除），改选中目标主分组，避免选中已删除的节点。
+    selectedId = wasGroup ? group.id : draggedNode.id;
     selectedImage = {nodeId:'', index:-1};
     return true;
 }
@@ -14220,7 +14283,8 @@ window.onmouseup = e => {
         const groupTarget = draggedNode && (draggedNode.images || []).length && (dragState.group || []).length <= 1 && draggedRect
             ? rectOverlapNode(draggedNode.id, draggedRect.x, draggedRect.y, draggedRect.width, draggedRect.height, dragState.groupIds)
             : null;
-        const smartGroupTarget = draggedNode && (dragState.group || []).length <= 1 ? smartGroupTargetForDraggedNode(draggedNode) : null;
+        // 拖分组时 dragState.group 里是分组本体+其成员（一起移动），属于“单个逻辑拖拽”，也允许触发并入目标分组。
+        const smartGroupTarget = draggedNode && (isSmartGroupNode(draggedNode) || (dragState.group || []).length <= 1) ? smartGroupTargetForDraggedNode(draggedNode) : null;
         if(
             insertHit &&
             insertLoopNodeIntoConnection(draggedNode, insertHit)
@@ -14280,7 +14344,11 @@ window.onmouseup = e => {
             stateChanged = true;
         }
         if(dragState.thumbDetached) stateChanged = true;
-        if(draggedNode && !isSmartGroupNode(draggedNode) && !smartGroupTarget) pruneSmartGroupMembershipsForNode(draggedNode);
+        // 拖出（没落到任何分组上）：普通节点退出所在分组；子分组退出时把它并入过的成员从主分组里撤掉。
+        if(draggedNode && !smartGroupTarget && pruneSmartGroupMembershipsForNode(draggedNode)){
+            stateChanged = true;
+            render();
+        }
         if(stateChanged) commitPendingUndo();
         else discardPendingUndo();
         if(stateChanged || dragState.thumbDetached) suppressNodeClickUntil = Date.now() + 180;
